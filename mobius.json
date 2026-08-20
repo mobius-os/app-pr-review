@@ -1,0 +1,34 @@
+{
+  "id": "pr-review",
+  "name": "Reviewer",
+  "version": "0.1.44",
+  "description": "Continuously reviews pull requests across selected repositories as a constructive quality-assurance second pair of eyes.",
+  "author": "mobius-os",
+  "license": "MIT",
+  "homepage": "https://github.com/mobius-os/app-pr-review",
+  "entry": "index.jsx",
+  "icon": "icon.png",
+  "offline_capable": false,
+  "permissions": {
+    "github_access": true,
+    "github_connect": true
+  },
+  "runtime": {
+    "imports": ["react", "react-dom", "lucide-react"],
+    "esm_deps": []
+  },
+  "schedule": {
+    "default": "*/5 * * * *",
+    "job": "job.sh"
+  },
+  "source_files": [
+    "api.js",
+    "domain.js",
+    "review-guide.js",
+    "review_engine.py",
+    "reviewer_runner.py",
+    "reviewing.md",
+    "storage.js",
+    "theme.js"
+  ]
+}
