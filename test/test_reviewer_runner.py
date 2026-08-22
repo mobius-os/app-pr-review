@@ -159,6 +159,9 @@ def test_model_process_environment_excludes_github_authority(monkeypatch, tmp_pa
   assert command[command.index("--mcp-config") + 1] == '{"mcpServers":{}}'
   assert command[command.index("--max-turns") + 1] == "10"
   assert "--strict-mcp-config" in command
+  # CLI-side structured output must stay off: its harness intermittently drops
+  # an empty findings array and kills every clean review pass.
+  assert "--json-schema" not in command
 
 
 def test_codex_review_agent_configuration_fails_closed():
@@ -292,8 +295,13 @@ def test_model_failure_is_durable_and_classified(
   assert record["status"] == expected_status
   assert before + expected_delay <= record["retry_after_epoch"] <= runner.time.time() + expected_delay
   assert ledger["last_status"] == expected_status
-  assert ledger["model_retry_after_epoch"] == record["retry_after_epoch"]
-  assert ledger["model_retry_status"] == expected_status
+  if expected_status == "waiting_for_model":
+    # One transient model failure backs off only its own revision; the run
+    # keeps moving instead of standing the whole provider down.
+    assert "model_retry_after_epoch" not in ledger
+  else:
+    assert ledger["model_retry_after_epoch"] == record["retry_after_epoch"]
+    assert ledger["model_retry_status"] == expected_status
   assert [event["kind"] for event in ledger["events"]] == ["review_attempt"]
 
 
@@ -307,6 +315,183 @@ def test_provider_choice_failure_is_a_model_failure(monkeypatch):
   ))
   with pytest.raises(runner.ReviewModelUnavailable, match="No configured"):
     runner.run_two_pass(bundle, "guide")
+
+
+def test_prune_drops_only_provably_closed_pull_records():
+  ledger = {
+    "pulls": {
+      "mobius-os/mobius#1": {"identity": "a" * 64, "status": "complete"},
+      "mobius-os/mobius#2": {"identity": "b" * 64, "status": "waiting_for_model"},
+      "mobius-os/app-memory#3": {"identity": "c" * 64, "status": "provider_setup_required"},
+      "mobius-os/app-store#4": {"identity": "d" * 64, "status": "waiting_for_capacity"},
+    },
+    "model_retry_after_epoch": 9999999999,
+    "model_retry_status": "waiting_for_model",
+    "model_retry_identity": "b" * 64,
+  }
+  assert runner.prune_closed_pull_records(
+    ledger,
+    # app-memory's listing failed this run; app-store is not selected.
+    listed_repositories={"mobius-os/mobius"},
+    candidate_keys={"mobius-os/mobius#1"},
+  ) is True
+  assert set(ledger["pulls"]) == {
+    "mobius-os/mobius#1", "mobius-os/app-memory#3", "mobius-os/app-store#4",
+  }
+  # The provider backoff outlives its pruned owner and expires on its own.
+  assert ledger["model_retry_after_epoch"] == 9999999999
+
+
+def test_run_prunes_closed_pull_records_with_listing_proof(tmp_path, monkeypatch):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  (tmp_path / "settings.json").write_text(json.dumps({
+    "selectedRepos": ["mobius-os/mobius", "mobius-os/app-memory"],
+    "automation": {"paused": False},
+  }))
+  runner.LEDGER_PATH.parent.mkdir(parents=True)
+  runner.LEDGER_PATH.write_text(json.dumps({
+    "schema": 1, "events": [], "pulls": {
+      "mobius-os/mobius#1": {"identity": "a" * 64, "status": "complete"},
+      "mobius-os/mobius#2": {"identity": "b" * 64, "status": "waiting_for_model"},
+      "mobius-os/app-memory#3": {"identity": "c" * 64, "status": "provider_setup_required"},
+      "other/repo#4": {"identity": "d" * 64, "status": "complete"},
+    },
+  }))
+  monkeypatch.setattr(runner, "list_accessible_repositories", lambda: [])
+  def pulls(repo):
+    if repo == "mobius-os/app-memory":
+      raise RuntimeError("GitHub unavailable")
+    # Recently updated, so the debounce skips it without any model work.
+    return [{"number": 1, "draft": False, "updated_at": runner.utc_now()}]
+  monkeypatch.setattr(runner, "list_open_prs", pulls)
+
+  assert runner.run() == 0
+  ledger = json.loads(runner.LEDGER_PATH.read_text())
+  # #2 is provably closed (its repo listed cleanly, it was absent) — pruned.
+  # #3's repo failed to list and #4's repo is unselected — both kept.
+  assert set(ledger["pulls"]) == {
+    "mobius-os/mobius#1", "mobius-os/app-memory#3", "other/repo#4",
+  }
+
+
+def test_single_model_flake_does_not_starve_other_reviews(tmp_path, monkeypatch):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  monkeypatch.setattr(runner, "GUIDE_PATH", tmp_path / "reviewing.md")
+  (tmp_path / "reviewing.md").write_text("guide")
+  (tmp_path / "settings.json").write_text(json.dumps({
+    "selectedRepos": ["mobius-os/mobius"],
+    "automation": {"paused": False},
+  }))
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [
+    {"number": 1, "draft": False, "updated_at": "2026-01-01T00:00:00Z"},
+    {"number": 2, "draft": False, "updated_at": "2026-01-02T00:00:00Z"},
+  ])
+  def collect(repo, pr, _previous=None):
+    return runner.ReviewBundle.build({
+      "repository": repo, "number": pr["number"],
+      "head_sha": ("a" if pr["number"] == 2 else "c") * 40, "base_sha": "b" * 40,
+    }), "full"
+  monkeypatch.setattr(runner, "collect_bundle", collect)
+  def two_pass(bundle, *_args, **_kwargs):
+    if bundle.number == 2:
+      raise runner.ReviewModelUnavailable("temporary malformed response")
+    return {"verified": {"summary": "clear", "findings": []}}
+  monkeypatch.setattr(runner, "run_two_pass", two_pass)
+
+  assert runner.run() == 0
+  ledger = json.loads(runner.LEDGER_PATH.read_text())
+  # The newer PR flaked and queued for retry; the older one still completed.
+  assert ledger["pulls"]["mobius-os/mobius#2"]["status"] == "waiting_for_model"
+  assert ledger["pulls"]["mobius-os/mobius#1"]["status"] == "complete"
+  assert "model_retry_after_epoch" not in ledger
+  assert ledger["last_status"] == "waiting_for_model"
+  assert [event["kind"] for event in ledger["events"]] == ["review_attempt", "review"]
+
+
+def test_repeated_model_failures_stand_the_runner_down(tmp_path, monkeypatch):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  monkeypatch.setattr(runner, "GUIDE_PATH", tmp_path / "reviewing.md")
+  (tmp_path / "reviewing.md").write_text("guide")
+  (tmp_path / "settings.json").write_text(json.dumps({
+    "selectedRepos": ["mobius-os/mobius"],
+    "automation": {"paused": False},
+  }))
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [
+    {"number": 1, "draft": False, "updated_at": "2026-01-01T00:00:00Z"},
+    {"number": 2, "draft": False, "updated_at": "2026-01-02T00:00:00Z"},
+    {"number": 3, "draft": False, "updated_at": "2026-01-03T00:00:00Z"},
+  ])
+  def collect(repo, pr, _previous=None):
+    return runner.ReviewBundle.build({
+      "repository": repo, "number": pr["number"],
+      "head_sha": (chr(ord("a") + pr["number"])) * 40, "base_sha": "b" * 40,
+    }), "full"
+  monkeypatch.setattr(runner, "collect_bundle", collect)
+  attempts = []
+  def two_pass(bundle, *_args, **_kwargs):
+    attempts.append(bundle.number)
+    raise runner.ReviewModelUnavailable("temporary malformed response")
+  monkeypatch.setattr(runner, "run_two_pass", two_pass)
+
+  assert runner.run() == 0
+  # The second consecutive failure reads as provider-wide: stand down, and
+  # never even attempt the third candidate.
+  assert attempts == [3, 2]
+  ledger = json.loads(runner.LEDGER_PATH.read_text())
+  assert ledger["model_retry_status"] == "waiting_for_model"
+  assert float(ledger["model_retry_after_epoch"]) > runner.time.time()
+  assert ledger["last_status"] == "waiting_for_model"
+  assert "mobius-os/mobius#1" not in ledger["pulls"]
+
+
+def test_capacity_failure_after_a_flake_stands_down_immediately(tmp_path, monkeypatch):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  monkeypatch.setattr(runner, "GUIDE_PATH", tmp_path / "reviewing.md")
+  (tmp_path / "reviewing.md").write_text("guide")
+  (tmp_path / "settings.json").write_text(json.dumps({
+    "selectedRepos": ["mobius-os/mobius"],
+    "automation": {"paused": False},
+  }))
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [
+    {"number": 1, "draft": False, "updated_at": "2026-01-01T00:00:00Z"},
+    {"number": 2, "draft": False, "updated_at": "2026-01-02T00:00:00Z"},
+    {"number": 3, "draft": False, "updated_at": "2026-01-03T00:00:00Z"},
+  ])
+  def collect(repo, pr, _previous=None):
+    return runner.ReviewBundle.build({
+      "repository": repo, "number": pr["number"],
+      "head_sha": (chr(ord("a") + pr["number"])) * 40, "base_sha": "b" * 40,
+    }), "full"
+  monkeypatch.setattr(runner, "collect_bundle", collect)
+  attempts = []
+  def two_pass(bundle, *_args, **_kwargs):
+    attempts.append(bundle.number)
+    if bundle.number == 3:
+      raise runner.ReviewModelUnavailable("temporary malformed response")
+    raise runner.ReviewModelUnavailable("usage limit reached")
+  monkeypatch.setattr(runner, "run_two_pass", two_pass)
+
+  assert runner.run() == 0
+  # A provider-wide condition never spends the second flake slot: the capacity
+  # failure right after a flake arms the hour-long stand-down at once.
+  assert attempts == [3, 2]
+  ledger = json.loads(runner.LEDGER_PATH.read_text())
+  assert ledger["model_retry_status"] == "waiting_for_capacity"
+  assert ledger["last_status"] == "waiting_for_capacity"
+  assert ledger["pulls"]["mobius-os/mobius#2"]["status"] == "waiting_for_capacity"
+  assert "mobius-os/mobius#1" not in ledger["pulls"]
 
 
 def test_global_model_backoff_keeps_discovery_fresh_without_trying_another_pr(

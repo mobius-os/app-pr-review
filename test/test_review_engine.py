@@ -54,6 +54,36 @@ def test_hostile_content_is_inside_untrusted_envelope():
   assert prompt.index("<trusted-review-guide>") < prompt.index("<untrusted-pr-data")
 
 
+def test_wrapped_output_envelope_is_unwrapped():
+  parsed = parse_model_result(json.dumps({
+    "output": {"summary": "one issue", "findings": [finding()]},
+  }))
+  assert parsed["summary"] == "one issue"
+  assert len(parsed["findings"]) == 1
+
+
+def test_top_level_result_keys_are_never_mistaken_for_an_envelope():
+  parsed = parse_model_result({
+    "summary": "real", "findings": [], "output": {"summary": "decoy"},
+  })
+  assert parsed["summary"] == "real"
+
+
+def test_wrong_shaped_result_is_a_retry_not_a_clear_result():
+  for wrong in (
+    {"summary": "found two critical issues"},
+    {"summary": "clear", "findings": "none"},
+    {"summary": "clear", "findings": {"1": {}}},
+    {"result": {"summary": "clear", "findings": []}},
+    {"output": {"output": {"summary": "clear", "findings": []}}},
+  ):
+    try:
+      parse_model_result(wrong)
+    except ValueError:
+      continue
+    raise AssertionError(f"wrong shape was accepted as a clear result: {wrong!r}")
+
+
 def test_result_requires_evidence_failure_mode_and_valid_rubric():
   result = parse_model_result(json.dumps({
     "summary": "one issue",
