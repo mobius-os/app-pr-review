@@ -411,7 +411,13 @@ function AutomationView({ settings, onSettings, grant, grantStatus, grantMatches
         <div className="rv-setting rv-setting-tall"><div><strong>Post reviews automatically</strong><small>{postingCopy}</small></div><Toggle value={postingSwitchValue} disabled={!postingStateKnown || grantState === 'saving'} onChange={onPosting} label="Post reviews automatically" /></div>
         <div className="rv-setting"><div><strong>Daily automation limit</strong><small>{reviewsToday} review runs · {postsToday} posted today. This one limit caps both.</small></div><NumberSetting label="Daily automation limit" value={a.dailyLimit} min={1} max={100} onChange={value => setAutomation({ dailyLimit: value })} /></div>
         <div className="rv-setting"><div><strong>Comments per PR</strong><small>Maximum automatic comments across revisions of one pull request.</small></div><NumberSetting label="Comments per PR" value={a.commentsPerPr} min={1} max={20} onChange={value => setAutomation({ commentsPerPr: value })} /></div>
-        {(grantState === 'saving' || grantState === 'error') && <div className={`rv-inline-state ${grantState === 'error' ? 'error' : ''}`} aria-live="polite">{grantState === 'saving' ? 'Updating automatic posting…' : 'Automatic posting could not be updated; the previous state is unchanged.'}</div>}
+        {(grantState === 'saving' || grantState === 'error' || grantState === 'owner_required') && <div className={`rv-inline-state ${grantState !== 'saving' ? 'error' : ''}`} aria-live="polite">{
+          grantState === 'saving'
+            ? 'Updating automatic posting…'
+            : grantState === 'owner_required'
+              ? 'Ask Möbius in chat to approve this automatic-posting change. The previous state is unchanged.'
+              : 'Automatic posting could not be updated; the previous state is unchanged.'
+        }</div>}
       </div>
 
       <div className="rv-setting-group">
@@ -609,7 +615,7 @@ export default function App({ appId, token }) {
       }
       saveLocalIntent()
       setGrantState('saved')
-    } catch {
+    } catch (error) {
       try {
         const result = await fetchReviewerGrant(token, appId)
         const authoritative = result?.grant || null
@@ -623,10 +629,10 @@ export default function App({ appId, token }) {
         if (confirmed) {
           saveLocalIntent()
           setGrantState('saved')
-        } else setGrantState('error')
+        } else setGrantState(error?.status === 403 ? 'owner_required' : 'error')
       } catch {
         setGrantStatus('error')
-        setGrantState('error')
+        setGrantState(error?.status === 403 ? 'owner_required' : 'error')
       }
     } finally {
       postingRequestRef.current = false
@@ -675,9 +681,11 @@ export default function App({ appId, token }) {
       } else if (['posting', 'uncertain', 'superseded'].includes(authoritative?.status)) {
         setSendStates(current => ({ ...current, [identity]: { phase: authoritative.status } }))
       } else {
-        const message = error?.status === 409
-          ? 'The PR or stored review changed. Refresh before sending.'
-          : error?.message || 'The comment was not sent.'
+        const message = error?.status === 403
+          ? 'Ask Möbius in chat to send this exact review comment.'
+          : error?.status === 409
+            ? 'The PR or stored review changed. Refresh before sending.'
+            : error?.message || 'The comment was not sent.'
         setSendStates(current => ({ ...current, [identity]: { phase: 'error', message } }))
       }
     }
