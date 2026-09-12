@@ -1,7 +1,7 @@
 {
   "id": "pr-review",
   "name": "Reviewer",
-  "version": "0.1.44",
+  "version": "0.1.45",
   "description": "Continuously reviews pull requests across selected repositories as a constructive quality-assurance second pair of eyes.",
   "author": "mobius-os",
   "license": "MIT",
