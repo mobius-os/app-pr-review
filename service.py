@@ -12,7 +12,8 @@ from pathlib import Path
 
 
 REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
-SHA = re.compile(r"^[0-9a-f]{40,64}$")
+COMMIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RAW_MENTION = re.compile(r"@[A-Za-z0-9_-]")
 RAW_HTML = re.compile(r"<\s*/?\s*[A-Za-z][^>]*>")
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(")
@@ -67,7 +68,7 @@ def normalize_grant(body: dict) -> dict:
   if not repos or len(repos) > 100 or any(REPO.fullmatch(repo) is None for repo in repos):
     raise Rejected(422, "repositories must contain 1-100 owner/name values")
   guide_hash = str(body.get("guide_hash") or "").lower()
-  if SHA.fullmatch(guide_hash) is None:
+  if SHA256.fullmatch(guide_hash) is None:
     raise Rejected(422, "guide_hash must be a SHA-256 digest")
   max_rounds = body.get("max_rounds_per_pr")
   daily_ceiling = body.get("daily_post_ceiling")
@@ -86,7 +87,7 @@ def normalize_grant(body: dict) -> dict:
 def validate_comment(body: dict) -> dict:
   head_sha = str(body.get("head_sha") or "").lower()
   comment = str(body.get("body") or "").strip()
-  if SHA.fullmatch(head_sha) is None:
+  if COMMIT_SHA.fullmatch(head_sha) is None:
     raise Rejected(422, "Reviewer comment head SHA is invalid.")
   if not comment or len(comment) > 30_000:
     raise Rejected(422, "Reviewer comment must contain 1-30000 characters.")

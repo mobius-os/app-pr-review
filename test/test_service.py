@@ -24,17 +24,44 @@ def test_grant_policy_normalizes_repositories_and_enforces_ceilings():
     service.normalize_grant({**result, "daily_post_ceiling": 101})
 
 
-def test_comment_policy_binds_safe_text_to_the_exact_head():
-  head = "abcdef1234567890" + "0" * 24
-  comment = "### Reviewer: all clear\n\nLooks good.\n\n_Reviewed revision `abcdef123456`._"
+@pytest.mark.parametrize("guide_hash", ["a" * 40, "a" * 63, "a" * 65])
+def test_grant_policy_requires_an_exact_sha256_guide_hash(guide_hash):
+  with pytest.raises(service.Rejected, match="SHA-256"):
+    service.normalize_grant({
+      "repositories": ["mobius-os/mobius"],
+      "guide_hash": guide_hash,
+      "max_rounds_per_pr": 5,
+      "daily_post_ceiling": 12,
+    })
+
+
+@pytest.mark.parametrize("head", ["abcdef1234567890" + "0" * 24, "a" * 64])
+def test_comment_policy_binds_safe_text_to_the_exact_head(head):
+  comment = f"### Reviewer: all clear\n\nLooks good.\n\n_Reviewed revision `{head[:12]}`._"
   assert service.validate_comment({"head_sha": head, "body": comment})["body"] == comment
-  with pytest.raises(service.Rejected, match="active mention"):
-    service.validate_comment({"head_sha": head, "body": comment.replace("Looks good.", "Thanks @owner")})
 
 
-def test_manual_plan_is_bound_to_private_draft_guidance_and_selection(
-  tmp_path, monkeypatch,
-):
+@pytest.mark.parametrize("length", [39, 41, 63, 65])
+def test_comment_policy_rejects_non_git_hash_lengths(length):
+  head = "a" * length
+  comment = f"### Reviewer: all clear\n\nClean.\n\n_Reviewed revision `{head[:12]}`._"
+  with pytest.raises(service.Rejected, match="head SHA"):
+    service.validate_comment({"head_sha": head, "body": comment})
+
+
+@pytest.mark.parametrize("comment", [
+  "arbitrary app comment\n\n_Reviewed revision `aaaaaaaaaaaa`._",
+  "### Reviewer: QA second look\n\nPing @someone\n\n_Reviewed revision `aaaaaaaaaaaa`._",
+  "### Reviewer: QA second look\n\n<img src=x>\n\n_Reviewed revision `aaaaaaaaaaaa`._",
+  "### Reviewer: QA second look\n\n![pixel](https://evil.test)\n\n_Reviewed revision `aaaaaaaaaaaa`._",
+  "### Reviewer: all clear\n\nClean.\n\n_Reviewed revision `bbbbbbbbbbbb`._",
+])
+def test_comment_policy_rejects_unbound_or_active_public_content(comment):
+  with pytest.raises(service.Rejected):
+    service.validate_comment({"head_sha": "a" * 40, "body": comment})
+
+
+def _manual_case(tmp_path, monkeypatch):
   storage = tmp_path / "storage"
   (storage / "job-state").mkdir(parents=True)
   monkeypatch.setenv("APP_STORAGE_DIR", str(storage))
@@ -46,7 +73,8 @@ def test_manual_plan_is_bound_to_private_draft_guidance_and_selection(
     "customGuidance": "Prefer the smallest durable correction.",
     "repoGuidance": {repository: "Protect owner data."},
   }
-  (storage / "settings.json").write_text(json.dumps(settings))
+  settings_path = storage / "settings.json"
+  settings_path.write_text(json.dumps(settings))
   effective = (
     guide + "\n\n---\n\n# Workspace guidance\n\n"
     + settings["customGuidance"]
@@ -76,8 +104,8 @@ def test_manual_plan_is_bound_to_private_draft_guidance_and_selection(
     "private": True,
     "draft_comment": comment,
   }
-  ledger = {"pulls": {f"{repository}#7": record}}
-  (storage / "job-state" / "ledger.json").write_text(json.dumps(ledger))
+  ledger_path = storage / "job-state" / "ledger.json"
+  ledger_path.write_text(json.dumps({"pulls": {f"{repository}#7": record}}))
   request = {
     "identity": identity,
     "repository": repository,
@@ -87,8 +115,41 @@ def test_manual_plan_is_bound_to_private_draft_guidance_and_selection(
     "guide_hash": guide_hash,
     "body": comment,
   }
+  return request, settings_path, ledger_path
 
-  assert service.manual_plan(request)["identity"] == identity
-  request["body"] = comment.replace("Clean.", "Changed.")
+
+def test_manual_plan_is_bound_to_private_draft_guidance_and_selection(
+  tmp_path, monkeypatch,
+):
+  request, _settings, _ledger = _manual_case(tmp_path, monkeypatch)
+  assert service.manual_plan(request)["identity"] == request["identity"]
+  request["body"] = request["body"].replace("Clean.", "Changed.")
   with pytest.raises(service.Rejected, match="draft or guidance changed"):
+    service.manual_plan(request)
+
+
+@pytest.mark.parametrize(
+  "mismatch", ["body", "guide", "identity", "selection", "source", "public"],
+)
+def test_manual_plan_rejects_every_stale_or_public_draft(
+  tmp_path, monkeypatch, mismatch,
+):
+  request, settings_path, ledger_path = _manual_case(tmp_path, monkeypatch)
+  if mismatch == "body":
+    request["body"] = request["body"].replace("Clean.", "Changed.")
+  elif mismatch == "guide":
+    request["guide_hash"] = "d" * 64
+  elif mismatch == "identity":
+    request["identity"] = "e" * 64
+  elif mismatch == "selection":
+    settings = json.loads(settings_path.read_text())
+    settings["selectedRepos"] = []
+    settings_path.write_text(json.dumps(settings))
+  elif mismatch == "source":
+    monkeypatch.setattr(service, "_read_guide", lambda: "# Changed Reviewer guide")
+  else:
+    ledger = json.loads(ledger_path.read_text())
+    ledger["pulls"]["mobius-os/mobius#7"]["private"] = False
+    ledger_path.write_text(json.dumps(ledger))
+  with pytest.raises(service.Rejected, match="draft|guidance|selected"):
     service.manual_plan(request)
