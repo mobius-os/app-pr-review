@@ -58,6 +58,9 @@ MODEL_WAIT_STATUSES = {
 MANUAL_RETRY_STATUSES = {"waiting_for_model"}
 # A completed review in one of these states has nothing left to post.
 SETTLED_POST_STATUSES = {"posted", "posting", "uncertain", "superseded", "blocked"}
+# The account's repository list changes rarely; listing it pages through up to
+# 2000 rows, so discovery reuses the last snapshot for this long.
+REPOSITORY_LIST_MAX_AGE_SECONDS = 60 * 60
 
 
 class RevisionChanged(RuntimeError):
@@ -482,19 +485,31 @@ def discovery_pull(repository: str, row: dict) -> dict:
 def save_discovery(settings: dict, candidates: list[tuple[str, dict]], errors: list[dict]) -> None:
   discovery_path = STORAGE_DIR / "discovery.json"
   previous = _read_json(discovery_path, {})
-  try:
-    repositories = list_accessible_repositories()
-    repository_error = None
-  except Exception as exc:
-    repositories = previous.get("repositories", []) if isinstance(previous, dict) else []
-    repository_error = str(exc)[-300:]
+  if not isinstance(previous, dict):
+    previous = {}
+  repositories_listed_epoch = previous.get("repositoriesListedEpoch")
+  repository_error = previous.get("repositoryError")
+  if (
+    isinstance(repositories_listed_epoch, (int, float))
+    and isinstance(previous.get("repositories"), list)
+    and 0 <= time.time() - repositories_listed_epoch < REPOSITORY_LIST_MAX_AGE_SECONDS
+  ):
+    repositories = previous["repositories"]
+  else:
+    try:
+      repositories = list_accessible_repositories()
+      repositories_listed_epoch = time.time()
+      repository_error = None
+    except Exception as exc:
+      repositories = previous.get("repositories", [])
+      repository_error = str(exc)[-300:]
   try:
     detected = discover_mobius_repositories()
   except Exception:
-    detected = previous.get("detectedRepos", []) if isinstance(previous, dict) else []
+    detected = previous.get("detectedRepos", [])
   pull_rows = [discovery_pull(repository, row) for repository, row in candidates]
   failed_repositories = {str(row.get("repository") or "") for row in errors}
-  previous_pulls = previous.get("pulls", []) if isinstance(previous, dict) else []
+  previous_pulls = previous.get("pulls", [])
   def snapshot_key(row):
     try:
       number = int(row.get("number") or 0)
@@ -513,6 +528,7 @@ def save_discovery(settings: dict, candidates: list[tuple[str, dict]], errors: l
     "schema": 1, "refreshedAt": utc_now(),
     "selectedRepos": settings["selected_repos"],
     "repositories": repositories,
+    "repositoriesListedEpoch": repositories_listed_epoch,
     "detectedRepos": detected,
     "pulls": pull_rows,
     "errors": errors,

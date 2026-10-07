@@ -1084,3 +1084,22 @@ def test_completed_review_awaiting_automatic_post_is_never_settled_from_listing(
   assert runner.run() == 0
   assert fetches == ["bundle", "bundle"]
 
+
+def test_discovery_reuses_the_repository_list_within_its_max_age(tmp_path, monkeypatch):
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  calls = []
+  monkeypatch.setattr(runner, "list_accessible_repositories", lambda: (
+    calls.append("list") or [{"nameWithOwner": "mobius-os/mobius"}]
+  ))
+  settings = {"selected_repos": ["mobius-os/mobius"]}
+
+  runner.save_discovery(settings, [], [])
+  runner.save_discovery(settings, [], [])
+  assert calls == ["list"]
+  discovery = json.loads((tmp_path / "discovery.json").read_text())
+  assert discovery["repositories"] == [{"nameWithOwner": "mobius-os/mobius"}]
+
+  discovery["repositoriesListedEpoch"] -= runner.REPOSITORY_LIST_MAX_AGE_SECONDS + 1
+  (tmp_path / "discovery.json").write_text(json.dumps(discovery))
+  runner.save_discovery(settings, [], [])
+  assert calls == ["list", "list"]
