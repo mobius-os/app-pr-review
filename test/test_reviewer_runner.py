@@ -1012,3 +1012,75 @@ def test_failed_repository_retains_last_known_open_prs_as_stale(tmp_path, monkey
     "repository": "flaky/repo", "number": 4, "title": "Last known PR",
     "snapshotStale": True,
   }]
+
+
+def _settled_fixture(tmp_path, monkeypatch, *, automatic_posting=False):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  monkeypatch.setattr(runner, "GUIDE_PATH", tmp_path / "reviewing.md")
+  monkeypatch.setattr(runner, "list_accessible_repositories", lambda: [])
+  monkeypatch.setattr(runner, "load_posting_grant", lambda: None)
+  (tmp_path / "reviewing.md").write_text("guide")
+  (tmp_path / "settings.json").write_text(json.dumps({
+    "selectedRepos": ["mobius-os/mobius"],
+    "automation": {"paused": False, "automaticPosting": automatic_posting},
+  }))
+  bundle = runner.ReviewBundle.build({
+    "repository": "mobius-os/mobius", "number": 5,
+    "head_sha": "a" * 40, "base_sha": "b" * 40,
+  })
+  identity = runner.review_identity(bundle, "guide")
+  runner.LEDGER_PATH.parent.mkdir(parents=True)
+  runner.LEDGER_PATH.write_text(json.dumps({"schema": 1, "events": [], "pulls": {
+    "mobius-os/mobius#5": {
+      "identity": identity.key, "status": "complete", "private": True,
+      "head_sha": bundle.head_sha, "base_sha": bundle.base_sha,
+      "guide_hash": identity.guide_hash, "findings": [], "draft_comment": "x",
+    },
+  }}))
+  listing = {
+    "number": 5, "updated_at": "2026-01-01T00:00:00Z",
+    "head": {"sha": "a" * 40}, "base": {"sha": "b" * 40},
+  }
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [dict(listing)])
+  fetches = []
+  monkeypatch.setattr(runner, "collect_bundle", lambda *_args: (
+    fetches.append("bundle") or (bundle, "full")
+  ))
+  monkeypatch.setattr(runner, "run_two_pass", lambda *_args, **_kwargs: (
+    (_ for _ in ()).throw(AssertionError("settled revision was reviewed again"))
+  ))
+  return listing, fetches
+
+
+def test_unchanged_listing_skips_pull_detail_and_files_fetch(tmp_path, monkeypatch):
+  _listing, fetches = _settled_fixture(tmp_path, monkeypatch)
+
+  assert runner.run() == 0  # first run confirms the identity from a full fetch
+  assert runner.run() == 0  # second run settles it from the listing alone
+  assert fetches == ["bundle"]
+  record = json.loads(runner.LEDGER_PATH.read_text())["pulls"]["mobius-os/mobius#5"]
+  assert record["listed_updated_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_listing_with_new_updated_at_refetches_the_bundle(tmp_path, monkeypatch):
+  listing, fetches = _settled_fixture(tmp_path, monkeypatch)
+  assert runner.run() == 0
+  listing["updated_at"] = "2026-01-02T00:00:00Z"
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [dict(listing)])
+
+  assert runner.run() == 0
+  assert fetches == ["bundle", "bundle"]
+
+
+def test_completed_review_awaiting_automatic_post_is_never_settled_from_listing(
+  tmp_path, monkeypatch,
+):
+  _listing, fetches = _settled_fixture(tmp_path, monkeypatch, automatic_posting=True)
+
+  assert runner.run() == 0
+  assert runner.run() == 0
+  assert fetches == ["bundle", "bundle"]
+
