@@ -550,6 +550,10 @@ def listed_revision_is_settled(previous: dict, pr: dict, guide: str, settings: d
   status = previous.get("status")
   if status not in {"complete", "skipped"}:
     return False
+  # A head-to-head delta does not prove coverage of the full PR under the
+  # current base and guidance. Fetch the full bundle before settling it.
+  if previous.get("review_mode") == "delta":
+    return False
   if (
     status == "complete" and settings["automatic_posting"]
     and previous.get("private") is True
@@ -1012,6 +1016,8 @@ def run() -> int:
           previous["listed_updated_at"] = pr.get("updated_at")
           previous["guide_hash"] = identity.guide_hash
           previous["base_sha"] = bundle.base_sha
+          if review_mode == "full":
+            previous["review_mode"] = "full"
         if previous.get("status") == "skipped":
           continue
         if previous.get("status") == "complete":

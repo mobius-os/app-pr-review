@@ -1085,6 +1085,99 @@ def test_completed_review_awaiting_automatic_post_is_never_settled_from_listing(
   assert fetches == ["bundle", "bundle"]
 
 
+@pytest.mark.parametrize("changed_scope", ["guidance", "base", "guidance_and_base"])
+def test_head_and_scope_changes_require_full_review_after_delta(
+  tmp_path, monkeypatch, changed_scope,
+):
+  monkeypatch.setattr(runner, "TOKEN", "app-token")
+  monkeypatch.setattr(runner, "STATE_DIR", tmp_path / "job-state")
+  monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
+  monkeypatch.setattr(runner, "LEDGER_PATH", tmp_path / "job-state" / "ledger.json")
+  monkeypatch.setattr(runner, "GUIDE_PATH", tmp_path / "reviewing.md")
+  monkeypatch.setattr(runner, "list_accessible_repositories", lambda: [])
+  monkeypatch.setattr(runner, "load_posting_grant", lambda: None)
+  runner.GUIDE_PATH.write_text("guide")
+  settings = {
+    "selectedRepos": ["mobius-os/mobius"],
+    "automation": {"paused": False, "automaticPosting": False},
+  }
+  (tmp_path / "settings.json").write_text(json.dumps(settings))
+  listing = {
+    "number": 5, "updated_at": "2026-01-01T00:00:00Z",
+    "head": {"sha": "a" * 40}, "base": {"sha": "b" * 40},
+  }
+  monkeypatch.setattr(runner, "list_open_prs", lambda _repo: [dict(listing)])
+  policy = {"filename": "policy.py", "patch": "@@ -0,0 +1 @@\n+policy = True"}
+  helper = {"filename": "helper.py", "patch": "@@ -0,0 +1 @@\n+helper = True"}
+  full_files = [policy]
+  fetches = []
+
+  def github(path):
+    fetches.append(path)
+    if path == "repos/mobius-os/mobius/pulls/5":
+      return dict(listing)
+    if path == f"repos/mobius-os/mobius/compare/{'a' * 40}...{'c' * 40}?per_page=100":
+      return {"files": [helper]}
+    if path == "repos/mobius-os/mobius/pulls/5/files?per_page=100&page=1":
+      return list(full_files)
+    raise AssertionError(f"Unexpected GitHub request: {path}")
+
+  monkeypatch.setattr(runner, "_github", github)
+  reviews = []
+
+  def review(bundle, guide, *, refresh_bundle, **_kwargs):
+    assert refresh_bundle().content_hash == bundle.content_hash
+    reviews.append(([row["path"] for row in bundle.files], guide, bundle.base_sha))
+    return {"verified": {"summary": "clear", "findings": []}}
+
+  monkeypatch.setattr(runner, "run_two_pass", review)
+  assert runner.run() == 0
+  assert reviews == [(["policy.py"], "guide", "b" * 40)]
+
+  listing["head"] = {"sha": "c" * 40}
+  listing["updated_at"] = "2026-01-02T00:00:00Z"
+  if "base" in changed_scope:
+    listing["base"] = {"sha": "d" * 40}
+  if "guidance" in changed_scope:
+    settings["customGuidance"] = "Recheck policy behavior."
+    (tmp_path / "settings.json").write_text(json.dumps(settings))
+  guide = runner.effective_guide(runner.load_settings(), "mobius-os/mobius")
+  base = listing["base"]["sha"]
+  full_files.append(helper)
+  assert runner.run() == 0
+  assert reviews[1:] == [(["helper.py"], guide, base)]
+  record = json.loads(runner.LEDGER_PATH.read_text())["pulls"]["mobius-os/mobius#5"]
+  assert record["review_mode"] == "delta"
+
+  # The unchanged listing must not hide policy.py under the new scope.
+  assert runner.run() == 0
+  assert reviews[1:] == [
+    (["helper.py"], guide, base), (["policy.py", "helper.py"], guide, base),
+  ]
+  record = json.loads(runner.LEDGER_PATH.read_text())["pulls"]["mobius-os/mobius#5"]
+  assert record["review_mode"] == "full"
+  fetch_count = len(fetches)
+  assert runner.run() == 0
+  assert len(fetches) == fetch_count
+  assert len(reviews) == 3
+
+
+def test_delta_matching_full_bundle_settles_after_confirmation_without_new_model_pass(
+  tmp_path, monkeypatch,
+):
+  listing, fetches = _settled_fixture(tmp_path, monkeypatch)
+  ledger = json.loads(runner.LEDGER_PATH.read_text())
+  record = ledger["pulls"]["mobius-os/mobius#5"]
+  record.update({"review_mode": "delta", "listed_updated_at": listing["updated_at"]})
+  runner.LEDGER_PATH.write_text(json.dumps(ledger))
+
+  assert runner.run() == 0
+  record = json.loads(runner.LEDGER_PATH.read_text())["pulls"]["mobius-os/mobius#5"]
+  assert record["review_mode"] == "full"
+  assert runner.run() == 0
+  assert fetches == ["bundle"]
+
+
 def test_discovery_reuses_the_repository_list_within_its_max_age(tmp_path, monkeypatch):
   monkeypatch.setattr(runner, "STORAGE_DIR", tmp_path)
   calls = []
