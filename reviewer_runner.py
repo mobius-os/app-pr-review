@@ -25,7 +25,8 @@ from urllib.parse import urlparse
 from review_engine import (
   MAX_FILES, ReviewBundle, budget_allows, canonical_json, parse_model_result,
   patch_changed_line_evidence, reconcile_delta_findings, reconcile_findings,
-  render_review, review_identity, review_prompt, utc_now, validate_result_evidence,
+  render_review, review_identity, review_prompt, sha256, utc_now,
+  validate_result_evidence,
 )
 
 
@@ -55,6 +56,11 @@ MODEL_WAIT_STATUSES = {
   "waiting_for_capacity", "waiting_for_model",
 }
 MANUAL_RETRY_STATUSES = {"waiting_for_model"}
+# A completed review in one of these states has nothing left to post.
+SETTLED_POST_STATUSES = {"posted", "posting", "uncertain", "superseded", "blocked"}
+# The account's repository list changes rarely; listing it pages through up to
+# 2000 rows, so discovery reuses the last snapshot for this long.
+REPOSITORY_LIST_MAX_AGE_SECONDS = 60 * 60
 
 
 class RevisionChanged(RuntimeError):
@@ -479,19 +485,31 @@ def discovery_pull(repository: str, row: dict) -> dict:
 def save_discovery(settings: dict, candidates: list[tuple[str, dict]], errors: list[dict]) -> None:
   discovery_path = STORAGE_DIR / "discovery.json"
   previous = _read_json(discovery_path, {})
-  try:
-    repositories = list_accessible_repositories()
-    repository_error = None
-  except Exception as exc:
-    repositories = previous.get("repositories", []) if isinstance(previous, dict) else []
-    repository_error = str(exc)[-300:]
+  if not isinstance(previous, dict):
+    previous = {}
+  repositories_listed_epoch = previous.get("repositoriesListedEpoch")
+  repository_error = previous.get("repositoryError")
+  if (
+    isinstance(repositories_listed_epoch, (int, float))
+    and isinstance(previous.get("repositories"), list)
+    and 0 <= time.time() - repositories_listed_epoch < REPOSITORY_LIST_MAX_AGE_SECONDS
+  ):
+    repositories = previous["repositories"]
+  else:
+    try:
+      repositories = list_accessible_repositories()
+      repositories_listed_epoch = time.time()
+      repository_error = None
+    except Exception as exc:
+      repositories = previous.get("repositories", [])
+      repository_error = str(exc)[-300:]
   try:
     detected = discover_mobius_repositories()
   except Exception:
-    detected = previous.get("detectedRepos", []) if isinstance(previous, dict) else []
+    detected = previous.get("detectedRepos", [])
   pull_rows = [discovery_pull(repository, row) for repository, row in candidates]
   failed_repositories = {str(row.get("repository") or "") for row in errors}
-  previous_pulls = previous.get("pulls", []) if isinstance(previous, dict) else []
+  previous_pulls = previous.get("pulls", [])
   def snapshot_key(row):
     try:
       number = int(row.get("number") or 0)
@@ -510,11 +528,48 @@ def save_discovery(settings: dict, candidates: list[tuple[str, dict]], errors: l
     "schema": 1, "refreshedAt": utc_now(),
     "selectedRepos": settings["selected_repos"],
     "repositories": repositories,
+    "repositoriesListedEpoch": repositories_listed_epoch,
     "detectedRepos": detected,
     "pulls": pull_rows,
     "errors": errors,
     "repositoryError": repository_error,
   })
+
+
+def listed_revision_is_settled(previous: dict, pr: dict, guide: str, settings: dict) -> bool:
+  """True when the ledger already holds a final result for exactly the
+  revision the open-PR listing shows, so fetching the detail and files would
+  only re-derive the identity the ledger already has.
+
+  The listing carries head and base SHAs and `updated_at`; GitHub bumps
+  `updated_at` on title, body, and comment edits too, so a match means the
+  bundle content the identity hashes is unchanged. A completed review that
+  automatic posting may still publish is never settled: posting needs the
+  fresh bundle.
+  """
+  status = previous.get("status")
+  if status not in {"complete", "skipped"}:
+    return False
+  # A head-to-head delta does not prove coverage of the full PR under the
+  # current base and guidance. Fetch the full bundle before settling it.
+  if previous.get("review_mode") == "delta":
+    return False
+  if (
+    status == "complete" and settings["automatic_posting"]
+    and previous.get("private") is True
+    and previous.get("post_status") not in SETTLED_POST_STATUSES
+  ):
+    return False
+  head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+  base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+  listed_updated_at = pr.get("updated_at")
+  return bool(
+    listed_updated_at
+    and previous.get("listed_updated_at") == listed_updated_at
+    and str(previous.get("head_sha") or "").lower() == str(head.get("sha") or "").lower() != ""
+    and str(previous.get("base_sha") or "").lower() == str(base.get("sha") or "").lower() != ""
+    and previous.get("guide_hash") == sha256(guide.encode("utf-8"))
+  )
 
 
 def collect_bundle(
@@ -929,6 +984,9 @@ def run() -> int:
       manual_request = manual_retries.get(key)
       if global_retry_active and manual_request is None:
         continue
+      guide = effective_guide(settings, repository)
+      if manual_request is None and listed_revision_is_settled(previous, pr, guide, settings):
+        continue
       if not budget_allows(
         events, daily_ceiling=settings["daily_ceiling"],
         kind=("review", "review_attempt"),
@@ -939,7 +997,6 @@ def run() -> int:
       bundle, review_mode = collect_bundle(
         repository, pr, previous.get("head_sha"),
       )
-      guide = effective_guide(settings, repository)
       identity = review_identity(bundle, guide)
       manual_retry = bool(
         manual_request
@@ -953,6 +1010,14 @@ def run() -> int:
       if global_retry_active and not manual_retry:
         continue
       if previous.get("identity") == identity.key:
+        if previous.get("status") in {"complete", "skipped"}:
+          # Remember the listing that confirmed this identity so the next run
+          # can settle it from the listing alone.
+          previous["listed_updated_at"] = pr.get("updated_at")
+          previous["guide_hash"] = identity.guide_hash
+          previous["base_sha"] = bundle.base_sha
+          if review_mode == "full":
+            previous["review_mode"] = "full"
         if previous.get("status") == "skipped":
           continue
         if previous.get("status") == "complete":
@@ -1093,6 +1158,7 @@ def run() -> int:
         "base_sha": bundle.base_sha, "guide_hash": identity.guide_hash,
         "guide_version": REVIEW_GUIDE_VERSION,
         "bundle_hash": identity.bundle_hash, "status": "complete", "reviewed_at": utc_now(),
+        "listed_updated_at": pr.get("updated_at"),
         "review_mode": review_mode,
         "review_agents": result.get("review_agents", settings["review_agents"]),
         "summary": result["verified"]["summary"], "findings": findings,
